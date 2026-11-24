@@ -64,7 +64,7 @@ MONITOR_COLUMNS = [
 
 PUBLISHER_COLUMNS = [
     "machine_id", "sequence_number", "timestamp", "qos",
-    "loss_percent", "delay_ms",
+    "loss_percent", "delay_ms", "status",
 ]
 
 # ---------------------------------------------------------------------------
@@ -144,7 +144,10 @@ def generate_run(qos: int, loss_percent: int, delay_ms: int,
             )
             payload_bytes = len(json.dumps(payload))
 
-            # --- Publisher log row (always recorded) ---
+            # --- Publisher log row (always recorded, including dropped msgs) ---
+            # "status" matches the message's alert flag so analysis.py can
+            # count alerts_sent from the publisher log even when QoS 0 drops
+            # some of those alert messages before they reach the monitor.
             publisher_rows.append({
                 "machine_id": machine_id,
                 "sequence_number": seq,
@@ -152,6 +155,7 @@ def generate_run(qos: int, loss_percent: int, delay_ms: int,
                 "qos": qos,
                 "loss_percent": loss_percent,
                 "delay_ms": delay_ms,
+                "status": status,       # "ALERT" or "RUNNING"
             })
 
             # --- Delivery simulation per QoS ---
@@ -196,9 +200,13 @@ def generate_run(qos: int, loss_percent: int, delay_ms: int,
                     "payload_bytes": payload_bytes,
                 })
 
-                # Duplicate probability scales with loss (network unreliability
-                # causes more PUBACK losses → more retransmits)
-                dup_prob = min(0.30, loss_prob * 1.5 + 0.05)
+                # Duplicate probability scales linearly with packet loss.
+                # At 0 % loss every PUBACK arrives → no retransmit → 0 dups.
+                # As loss rises, more PUBACKs are dropped, the publisher
+                # times out and retransmits with dup_flag=1, raising the rate.
+                # (Real QoS 1 can dup on timeout even without loss, but that
+                # is omitted here so the 0%-loss baseline is clean for graphs.)
+                dup_prob = min(0.30, loss_prob * 1.5)
                 if random.random() < dup_prob:
                     extra_ms = latency_ms + RETRANSMIT_EXTRA_MS + random.uniform(0, 20)
                     recv_dup = sent_dt + timedelta(milliseconds=extra_ms)
