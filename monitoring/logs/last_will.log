@@ -1,0 +1,2 @@
+{"recv_time": "2026-11-24T19:38:19.669Z", "topic": "factory/MACHINE_04/status", "payload": {"machine_id": "MACHINE_04", "status": "OFFLINE", "timestamp": "2026-11-24T18:59:09.743Z", "message": "Unexpected machine disconnection"}}
+{"recv_time": "2026-11-24T19:38:19.674Z", "topic": "factory/MACHINE_01/status", "payload": {"machine_id": "MACHINE_01", "status": "OFFLINE", "timestamp": "2026-11-24T18:59:09.743Z", "message": "Unexpected machine disconnection"}}

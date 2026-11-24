@@ -17,8 +17,11 @@ import argparse
 import csv
 import json
 import os
+import queue
 import sys
 import threading
+import urllib.request
+import urllib.error
 
 from datetime import datetime, timezone
 from typing import Any
@@ -63,6 +66,66 @@ CONFIG = None
 csv_file = None
 csv_writer = None
 csv_lock = threading.Lock()
+
+# ---------------------------------------------------------
+# DASHBOARD EVENT FORWARDING (non-blocking)
+# ---------------------------------------------------------
+
+DASHBOARD_URL = os.environ.get(
+    "DASHBOARD_URL", "http://127.0.0.1:8000"
+)
+
+# Thread-safe queue for forwarding events to the dashboard
+_event_queue = queue.Queue(maxsize=5000)
+_forward_thread = None
+
+
+def _forward_worker():
+    """Background thread that drains the event queue and POSTs to FastAPI.
+
+    Runs continuously. If the dashboard backend is unavailable, events
+    are silently dropped so CSV logging is never blocked.
+    """
+    while True:
+        try:
+            event = _event_queue.get(timeout=2)
+        except queue.Empty:
+            continue
+
+        if event is None:
+            break  # Poison pill for shutdown
+
+        endpoint, payload = event
+        try:
+            body = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                f"{DASHBOARD_URL}{endpoint}",
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=2)
+        except Exception:
+            # Dashboard is unavailable – that's fine, CSV still logs
+            pass
+
+
+def _start_forward_thread():
+    """Start the background forwarding thread (called once at startup)."""
+    global _forward_thread
+    if _forward_thread is None or not _forward_thread.is_alive():
+        _forward_thread = threading.Thread(
+            target=_forward_worker, daemon=True
+        )
+        _forward_thread.start()
+
+
+def forward_to_dashboard(endpoint: str, payload: dict):
+    """Enqueue an event for the dashboard (non-blocking)."""
+    try:
+        _event_queue.put_nowait((endpoint, payload))
+    except queue.Full:
+        pass  # Drop oldest events silently
 
 
 # ---------------------------------------------------------
@@ -340,6 +403,23 @@ def on_message(client, userdata, msg):
             f"Alert: {level}"
         )
 
+        # Forward to dashboard (non-blocking)
+        forward_to_dashboard("/api/monitoring/event", {
+            "recv_time": recv_time,
+            "topic": topic,
+            "machine_id": machine_id,
+            "sequence_number": sequence_number,
+            "timestamp": timestamp,
+            "qos": qos,
+            "dup_flag": dup_flag,
+            "is_alert": is_alert,
+            "payload_bytes": payload_bytes,
+            "temperature": data.get("temperature"),
+            "vibration": data.get("vibration"),
+            "status": data.get("status", "RUNNING"),
+            "alert_level": level,
+        })
+
     except Exception as e:
 
         print(f"❗ CSV logging error: {e}")
@@ -378,6 +458,9 @@ def main():
         print(f"❌ CSV initialization failed: {e}")
         sys.exit(1)
 
+    # Start dashboard forwarding thread
+    _start_forward_thread()
+
     client = mqtt.Client()
 
     client.username_pw_set(
@@ -409,6 +492,15 @@ def main():
             BROKER_PORT,
             keepalive=60
         )
+
+        # Notify dashboard of monitoring start
+        forward_to_dashboard("/api/monitoring/status", {
+            "monitoring_active": True,
+            "broker_connected": True,
+            "qos": CONFIG.qos,
+            "loss": CONFIG.loss,
+            "delay": CONFIG.delay,
+        })
 
         print("\nMonitoring started. Press Ctrl+C to stop.")
 
