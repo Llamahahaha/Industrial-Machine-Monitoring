@@ -1,142 +1,450 @@
-'''monitor.py
 
-Simple MQTT subscriber for an Industrial Machine Monitoring System.
+"""
+Industrial Machine Monitoring - MQTT Subscriber
 
 Features:
-- Connects to a Mosquitto broker (configurable IP and port).
-- Subscribes to the topic ``factory/#`` to receive data from any machine.
-- Decodes JSON payloads and prints ``machine_id``, ``temperature``, ``vibration`` and ``status``.
-- Handles connection loss and attempts to reconnect.
-- Runs continuously until the program is stopped (Ctrl+C).
+- Subscribes to factory/# using configurable QoS.
+- Decodes incoming JSON telemetry.
+- Integrates with alert_system.py.
+- Logs every normal MQTT message, including duplicates.
+- Creates one CSV file per experiment.
+- Stores Last Will messages separately.
+- Handles graceful shutdown and CSV flushing.
+"""
 
-This script is aimed at beginners – each function is documented with clear comments.
-'''
-
+# Standard library imports
+import argparse
+import csv
 import json
+import os
 import sys
-import time
+import threading
+
+from datetime import datetime, timezone
 from typing import Any
 
-
+# Third-party imports
 import paho.mqtt.client as mqtt
-from alert_system import process_telemetry, handle_last_will
+
+# Local imports
+from alert_system import evaluate_alert, handle_last_will
 
 
-# ---------------------------------------------------------------------------
-# Configuration – edit these values to match your MQTT broker.
-# ---------------------------------------------------------------------------
-BROKER_HOST = "10.219.34.191"   # Broker IP address (e.g., "192.168.1.100")
-BROKER_PORT = 1883  
+# ---------------------------------------------------------
+# CONFIGURATION
+# ---------------------------------------------------------
+
+BROKER_HOST = "10.219.34.191"
+BROKER_PORT = 1883
 
 USERNAME = "factoryuser"
-PASSWORD = "password123"        # Broker port (default for Mosquitto is 1883)
-TOPIC = "factory/#"         # Subscribe to all sub‑topics under "factory/"
+PASSWORD = "password123"
 
-# ---------------------------------------------------------------------------
-# Callback functions – MQTT invokes these when certain events happen.
-# ---------------------------------------------------------------------------
+TOPIC = "factory/#"
 
-def on_connect(client: mqtt.Client, userdata: Any, flags: dict, rc: int) -> None:
-    """Called when the client connects to the broker.
+LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
 
-    * ``rc`` is the connection result – 0 means success.
-    * If the connection is successful we subscribe to the topic.
-    """
+CSV_HEADERS = [
+    "recv_time",
+    "topic",
+    "machine_id",
+    "sequence_number",
+    "timestamp",
+    "qos",
+    "dup_flag",
+    "is_alert",
+    "payload_bytes",
+]
+
+# Shared experiment configuration
+CONFIG = None
+
+# CSV resources
+csv_file = None
+csv_writer = None
+csv_lock = threading.Lock()
+
+
+# ---------------------------------------------------------
+# COMMAND-LINE ARGUMENTS
+# ---------------------------------------------------------
+
+def parse_arguments():
+
+    parser = argparse.ArgumentParser(
+        description="Industrial Machine MQTT Monitoring"
+    )
+
+    parser.add_argument(
+        "--qos",
+        type=int,
+        choices=[0, 1, 2],
+        required=True
+    )
+
+    parser.add_argument(
+        "--loss",
+        type=int,
+        choices=[0, 5, 10, 20],
+        required=True
+    )
+
+    parser.add_argument(
+        "--delay",
+        type=int,
+        choices=[0, 100, 300],
+        required=True
+    )
+
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite an existing experiment CSV"
+    )
+
+    return parser.parse_args()
+
+
+# ---------------------------------------------------------
+# CSV INITIALIZATION
+# ---------------------------------------------------------
+
+def initialize_csv():
+
+    global csv_file, csv_writer
+
+    os.makedirs(LOG_DIR, exist_ok=True)
+
+    filename = (
+        f"qos{CONFIG.qos}_"
+        f"loss{CONFIG.loss}_"
+        f"delay{CONFIG.delay}.csv"
+    )
+
+    filepath = os.path.join(LOG_DIR, filename)
+
+    # Prevent accidental loss of previous experiment data
+    if os.path.exists(filepath) and not CONFIG.overwrite:
+        raise FileExistsError(
+            f"\nExperiment file already exists: {filepath}\n"
+            "Use --overwrite only if you intentionally want to replace it."
+        )
+
+    mode = "w" if CONFIG.overwrite else "x"
+
+    csv_file = open(
+        filepath,
+        mode,
+        newline="",
+        encoding="utf-8"
+    )
+
+    csv_writer = csv.writer(csv_file)
+
+    # Write exact CSV headers
+    csv_writer.writerow(CSV_HEADERS)
+
+    csv_file.flush()
+
+    print(f"\n📁 CSV logging enabled: {filepath}")
+
+    return filepath
+
+
+# ---------------------------------------------------------
+# CSV MESSAGE LOGGING
+# ---------------------------------------------------------
+
+def log_message(row):
+
+    with csv_lock:
+
+        csv_writer.writerow(row)
+
+        # Flush each row to reduce the chance of losing data
+        csv_file.flush()
+
+
+# ---------------------------------------------------------
+# LAST WILL LOGGING
+# ---------------------------------------------------------
+
+def log_last_will(data, topic):
+
+    os.makedirs(LOG_DIR, exist_ok=True)
+
+    last_will_path = os.path.join(
+        LOG_DIR,
+        "last_will.log"
+    )
+
+    record = {
+        "recv_time": datetime.now(timezone.utc).isoformat(
+            timespec="milliseconds"
+        ).replace("+00:00", "Z"),
+        "topic": topic,
+        "payload": data
+    }
+
+    with open(
+        last_will_path,
+        "a",
+        encoding="utf-8"
+    ) as f:
+
+        f.write(json.dumps(record) + "\n")
+
+        f.flush()
+
+    try:
+        handle_last_will(data)
+    except Exception as e:
+        print(f"❗ Last Will handler error: {e}")
+
+
+# ---------------------------------------------------------
+# MQTT CALLBACKS
+# ---------------------------------------------------------
+
+def on_connect(client, userdata, flags, rc):
+
     if rc == 0:
-        print(f"✅ Connected to MQTT broker at {BROKER_HOST}:{BROKER_PORT}")
-        # Subscribe to the topic; qos=1 ensures at‑least‑once delivery.
-        client.subscribe(TOPIC, qos=1)
-        print(f"🛰️  Subscribed to topic '{TOPIC}'")
+
+        print(
+            f"\n✅ Connected to MQTT broker "
+            f"at {BROKER_HOST}:{BROKER_PORT}"
+        )
+
+        # Subscribe using experiment QoS
+        client.subscribe(TOPIC, qos=CONFIG.qos)
+
+        print(
+            f"🛰️ Subscribed to {TOPIC} "
+            f"with QoS {CONFIG.qos}"
+        )
+
     else:
-        print(f"❌ Connection failed with code {rc}. See https://mqtt.org/documentation for codes.")
+
+        print(f"❌ MQTT connection failed. Code: {rc}")
 
 
-def on_message(client: mqtt.Client, userdata: Any, msg: mqtt.MQTTMessage) -> None:
-    """Called for each incoming message on a subscribed topic.
+def on_message(client, userdata, msg):
 
-    The payload should be a JSON dict. If it contains a normal telemetry
-    payload we forward it to ``process_telemetry`` which prints a concise
-    status line (NORMAL / WARNING / CRITICAL). If the payload is a Last
-    Will indicating the machine went OFFLINE we forward it to
-    ``handle_last_will``.
-    """
+    # Record arrival time immediately
+    recv_time = datetime.now(timezone.utc).isoformat(
+        timespec="milliseconds"
+    ).replace("+00:00", "Z")
+
+    # Extract MQTT-level information
+    topic = msg.topic
+    qos = msg.qos
+    dup_flag = int(bool(msg.dup))
+    payload_bytes = len(msg.payload)
+
+    # Decode payload
     try:
-        payload_str = msg.payload.decode('utf-8')
+
+        payload_str = msg.payload.decode("utf-8")
         data = json.loads(payload_str)
-    except json.JSONDecodeError:
-        print(f"⚠️  Received non‑JSON payload on topic {msg.topic}: {msg.payload}")
-        return
+
+        if not isinstance(data, dict):
+            raise ValueError("JSON payload must be an object")
+
     except Exception as e:
-        print(f"❗ Unexpected error decoding message: {e}")
+
+        print(f"⚠️ Invalid JSON on {topic}: {e}")
+
+        # Still log the received message
+        row = [
+            recv_time,
+            topic,
+            "",
+            "",
+            "",
+            qos,
+            dup_flag,
+            0,
+            payload_bytes
+        ]
+
+        log_message(row)
+
         return
 
-    # Detect a Last Will (offline) message – convention: status field == "OFFLINE"
-    if isinstance(data.get('status'), str) and data['status'].upper() == 'OFFLINE':
-        try:
-            handle_last_will(data)
-        except Exception as e:
-            print(f"❗ Error handling Last Will: {e}")
+    # Extract payload fields without changing timestamp
+    machine_id = data.get("machine_id", "")
+    sequence_number = data.get("sequence_number", "")
+
+    # Preserve the publisher timestamp exactly as received
+    timestamp = data.get("timestamp", "")
+
+    # Handle Last Will separately
+    if (
+        isinstance(data.get("status"), str)
+        and data["status"].upper() == "OFFLINE"
+    ):
+
+        print(
+            f"🔌 Last Will received for machine {machine_id}"
+        )
+
+        log_last_will(data, topic)
+
         return
 
-    # Normal telemetry – let the alert system decide the level and print it
+    # Alert detection
+    is_alert = 0
+
     try:
-        process_telemetry(data)
+
+        level = evaluate_alert(
+            machine_id if machine_id else "unknown",
+            data.get("temperature"),
+            data.get("vibration")
+        )
+
+        is_alert = int(
+            level not in ("NORMAL", "WAITING FOR DATA")
+        )
+
     except Exception as e:
-        print(f"❗ Error processing telemetry: {e}")
+
+        print(f"❗ Alert evaluation error: {e}")
+        level = "ALERT CHECK ERROR"
+
+    # Create CSV row
+    row = [
+        recv_time,
+        topic,
+        machine_id,
+        sequence_number,
+        timestamp,
+        qos,
+        dup_flag,
+        is_alert,
+        payload_bytes
+    ]
+
+    # Log every normal telemetry message, including duplicates
+    try:
+
+        log_message(row)
+
+        print(
+            f"[📊] Machine: {machine_id} | "
+            f"Sequence: {sequence_number} | "
+            f"Temp: {data.get('temperature')}°C | "
+            f"Vibration: {data.get('vibration')}g | "
+            f"QoS: {qos} | "
+            f"DUP: {dup_flag} | "
+            f"Alert: {level}"
+        )
+
+    except Exception as e:
+
+        print(f"❗ CSV logging error: {e}")
 
 
-def on_disconnect(client: mqtt.Client, userdata: Any, rc: int) -> None:
-    """Called when the client disconnects from the broker.
+def on_disconnect(client, userdata, rc):
 
-    ``rc`` == 0 means a graceful disconnect (e.g., we called ``client.disconnect()``).
-    Any other value indicates an unexpected loss of connection – we try to reconnect.
-    """
     if rc != 0:
-        print("🔌 Disconnected unexpectedly. Trying to reconnect…")
-        # The client will automatically attempt to reconnect if ``loop_forever``
-        # is used, but we can also explicitly call ``reconnect``.
-        try:
-            client.reconnect()
-        except Exception as e:
-            print(f"❌ Reconnection failed: {e}. Will keep trying…")
+
+        print(
+            "🔌 Unexpected MQTT disconnection. "
+            "Paho will attempt reconnection."
+        )
+
     else:
-        print("👋 Graceful disconnect.")
 
-# ---------------------------------------------------------------------------
-# Main entry point – set up the client and start the network loop.
-# ---------------------------------------------------------------------------
+        print("👋 Graceful MQTT disconnection.")
 
-def main() -> None:
-    # Create an MQTT client instance. ``client_id`` is optional – Mosquitto will assign one.
+
+# ---------------------------------------------------------
+# MAIN FUNCTION
+# ---------------------------------------------------------
+
+def main():
+
+    global CONFIG
+
+    CONFIG = parse_arguments()
+
+    try:
+
+        initialize_csv()
+
+    except (FileExistsError, OSError) as e:
+
+        print(f"❌ CSV initialization failed: {e}")
+        sys.exit(1)
+
     client = mqtt.Client()
-    # Set username and password for broker authentication
-    client.username_pw_set(USERNAME, PASSWORD)
-    # Register callbacks
+
+    client.username_pw_set(
+        USERNAME,
+        PASSWORD
+    )
+
     client.on_connect = on_connect
     client.on_message = on_message
     client.on_disconnect = on_disconnect
 
-    # Optional: enable automatic reconnect with exponential back‑off (default behaviour).
-    client.reconnect_delay_set(min_delay=1, max_delay=120)
+    client.reconnect_delay_set(
+        min_delay=1,
+        max_delay=120
+    )
 
-    # Connect to the broker inside a try/except to catch connection errors early.
     try:
-        client.connect(BROKER_HOST, BROKER_PORT, keepalive=60)
-    except Exception as e:
-        print(f"❌ Could not connect to broker at {BROKER_HOST}:{BROKER_PORT}: {e}")
-        sys.exit(1)
 
-    # ``loop_forever`` blocks the thread and handles network traffic, reconnections,
-    # and dispatches callbacks. It will run until the user interrupts (Ctrl+C).
-    try:
-        print("🚀 Starting MQTT loop – press Ctrl+C to stop.")
+        print("\n🚀 Starting Industrial Machine Monitor")
+
+        print(
+            f"Experiment: QoS={CONFIG.qos}, "
+            f"Loss={CONFIG.loss}%, "
+            f"Delay={CONFIG.delay}ms"
+        )
+
+        client.connect(
+            BROKER_HOST,
+            BROKER_PORT,
+            keepalive=60
+        )
+
+        print("\nMonitoring started. Press Ctrl+C to stop.")
+
         client.loop_forever()
+
     except KeyboardInterrupt:
-        print("\n🛑 Interrupted by user. Shutting down…")
+
+        print("\n🛑 Stopping monitoring...")
+
+    except Exception as e:
+
+        print(f"\n❌ MQTT error: {e}")
+
     finally:
-        client.disconnect()
-        # Give a moment for the disconnect callback to fire.
-        time.sleep(1)
+
+        try:
+            client.disconnect()
+        except Exception:
+            pass
+
+        # Ensure all pending CSV data is flushed and closed
+        if csv_file is not None:
+
+            with csv_lock:
+
+                csv_file.flush()
+                csv_file.close()
+
+            print("💾 CSV file flushed and closed.")
+
+        print("Monitoring stopped.")
+
+
+# ---------------------------------------------------------
+# PROGRAM ENTRY POINT
+# ---------------------------------------------------------
 
 if __name__ == "__main__":
     main()
