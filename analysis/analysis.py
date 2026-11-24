@@ -71,6 +71,7 @@ CONFIG = {
     "RES_ALERTS_SENT":       "alerts_sent",
     "RES_ALERTS_RECEIVED":   "alerts_received",
     "RES_AVG_ALERT_DELAY_MS": "avg_alert_delay_ms",
+    "RES_ALERTS_LOST_PCT":   "alerts_lost_pct",   # (alerts_sent-received)/sent × 100
 
     # ---- Alert definition -----------------------------------------------
     # Publisher log "status" values counted as alert messages.
@@ -97,6 +98,7 @@ RESULTS_COLUMNS = [
     CONFIG["RES_ALERTS_SENT"],
     CONFIG["RES_ALERTS_RECEIVED"],
     CONFIG["RES_AVG_ALERT_DELAY_MS"],
+    CONFIG["RES_ALERTS_LOST_PCT"],
 ]
 
 # Regex: extracts (qos, loss, delay) from any filename with the pattern
@@ -123,6 +125,11 @@ QOS_LABELS = {
     1: "QoS 1 (at-least-once)",
     2: "QoS 2 (exactly-once)",
 }
+# Per-QoS marker and line-style used on alerts_lost chart (and optionally
+# elsewhere) so that QoS 1 and QoS 2 are distinguishable when their lines
+# overlap (both stay at 0 % on a good network).
+QOS_MARKERS    = {0: "o",  1: "s",  2: "^"}   # circle, square, triangle
+QOS_LINESTYLES = {0: "-",  1: "--", 2: "-"}    # solid, dashed, solid
 GRAPH_DPI = 200
 GRAPH_FIGSIZE = (10, 6)
 _DELAY_SUBTITLE = "Averaged across delay values (0 / 100 / 300 ms)"
@@ -513,6 +520,11 @@ def compute_metrics(run: dict) -> "dict | None":
         c["RES_ALERTS_SENT"]:       alerts_sent,
         c["RES_ALERTS_RECEIVED"]:   alerts_received,
         c["RES_AVG_ALERT_DELAY_MS"]: round(avg_alert_delay, 2),
+        c["RES_ALERTS_LOST_PCT"]: round(
+            (alerts_sent - alerts_received) / alerts_sent * 100
+            if alerts_sent > 0 else 0.0,
+            2,
+        ),
     }
 
 
@@ -564,11 +576,47 @@ def print_summary_table(df: pd.DataFrame) -> None:
 # ===========================================================================
 
 def _save_fig(fig: plt.Figure, path: str) -> None:
-    """Save *fig* to *path* at GRAPH_DPI and close it."""
+    """
+    Save *fig* to *path* at GRAPH_DPI and close it.
+
+    Robustness measures:
+    - Deletes any existing file first so a viewer lock does not silently
+      produce a zero-byte or corrupt PNG.
+    - Catches OSError (e.g. the file is open in an image viewer on Windows)
+      and prints an actionable message instead of crashing.
+    """
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    fig.savefig(path, dpi=GRAPH_DPI, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved: {path}")
+
+    # Delete stale file so Windows file-lock errors surface clearly.
+    if os.path.exists(path):
+        try:
+            os.remove(path)
+        except OSError as exc:
+            print(
+                f"  [WARNING] Could not delete existing file '{path}': {exc}\n"
+                "  Close the image if it is open in a viewer, then re-run.",
+                file=sys.stderr,
+            )
+
+    # Add "Simulated sample data" footer to every figure
+    fig.text(
+        0.99, 0.01,
+        "Simulated sample data",
+        ha="right", va="bottom",
+        fontsize=7, color="gray", style="italic",
+    )
+
+    try:
+        fig.savefig(path, dpi=GRAPH_DPI, bbox_inches="tight")
+        print(f"  Saved: {path}")
+    except OSError as exc:
+        print(
+            f"  [ERROR] Could not save '{path}': {exc}\n"
+            "  Close the image if it is open in a viewer, then re-run.",
+            file=sys.stderr,
+        )
+    finally:
+        plt.close(fig)
 
 
 def _agg_vs_loss(df: pd.DataFrame, metric: str) -> pd.DataFrame:
@@ -666,7 +714,7 @@ def plot_latency_vs_loss(df: pd.DataFrame, graphs_dir: str) -> None:
         "Average Latency vs Packet Loss by QoS\n"
         f"({_DELAY_SUBTITLE})"
     )
-    ax.legend()
+    ax.legend(loc="best")
     ax.grid(True, alpha=0.3)
     _save_fig(fig, os.path.join(graphs_dir, "latency_vs_loss.png"))
 
@@ -694,7 +742,7 @@ def plot_delivery_ratio_vs_loss(df: pd.DataFrame, graphs_dir: str) -> None:
         "Message Delivery Ratio vs Packet Loss by QoS\n"
         f"({_DELAY_SUBTITLE})"
     )
-    ax.legend()
+    ax.legend(loc="best")
     ax.grid(True, alpha=0.3)
     _save_fig(fig, os.path.join(graphs_dir, "delivery_ratio_vs_loss.png"))
 
@@ -721,7 +769,7 @@ def plot_duplicates_vs_loss(df: pd.DataFrame, graphs_dir: str) -> None:
         "Duplicate Messages vs Packet Loss by QoS\n"
         f"({_DELAY_SUBTITLE})"
     )
-    ax.legend()
+    ax.legend(loc="best")
     ax.grid(True, alpha=0.3)
     _save_fig(fig, os.path.join(graphs_dir, "duplicates_vs_loss.png"))
 
@@ -748,7 +796,7 @@ def plot_throughput_vs_loss(df: pd.DataFrame, graphs_dir: str) -> None:
         "Message Throughput vs Packet Loss by QoS\n"
         f"({_DELAY_SUBTITLE})"
     )
-    ax.legend()
+    ax.legend(loc="best")
     ax.grid(True, alpha=0.3)
     _save_fig(fig, os.path.join(graphs_dir, "throughput_vs_loss.png"))
 
@@ -775,43 +823,47 @@ def plot_alert_delay_vs_loss(df: pd.DataFrame, graphs_dir: str) -> None:
         "Alert Message Latency vs Packet Loss by QoS\n"
         f"({_DELAY_SUBTITLE})"
     )
-    ax.legend()
+    ax.legend(loc="best")
     ax.grid(True, alpha=0.3)
     _save_fig(fig, os.path.join(graphs_dir, "alert_delay_vs_loss.png"))
 
 
 def plot_alerts_lost_vs_loss(df: pd.DataFrame, graphs_dir: str) -> None:
     """
-    Number of alert messages lost vs packet-loss %, one line per QoS.
-    alerts_lost = alerts_sent − alerts_received (clamped ≥ 0).
-    Expected: QoS 0 rises with loss; QoS 1/2 stay at 0.
+    Percentage of alert messages lost vs packet-loss %, one line per QoS.
+    alerts_lost_pct = (alerts_sent − alerts_received) / alerts_sent × 100.
+    QoS 1 uses a dashed line with square markers; QoS 2 solid with triangles
+    so they remain distinguishable when both sit near 0 %.
+    Legend is placed outside the plot area to avoid covering lines.
     """
     c = CONFIG
-    df = df.copy()
-    df["alerts_lost"] = (
-        df[c["RES_ALERTS_SENT"]] - df[c["RES_ALERTS_RECEIVED"]]
-    ).clip(lower=0)
-
-    agg = _agg_vs_loss(df, "alerts_lost")
+    metric = c["RES_ALERTS_LOST_PCT"]
+    agg = _agg_vs_loss(df, metric)
 
     fig, ax = plt.subplots(figsize=GRAPH_FIGSIZE)
     for qos in sorted(df[c["RES_QOS"]].unique()):
         sub = agg[agg[c["RES_QOS"]] == qos]
         ax.plot(
-            sub[c["RES_LOSS_PCT"]], sub["alerts_lost"],
-            marker="o", linewidth=2,
+            sub[c["RES_LOSS_PCT"]], sub[metric],
+            marker=QOS_MARKERS.get(qos, "o"),
+            linestyle=QOS_LINESTYLES.get(qos, "-"),
+            linewidth=2,
+            markersize=7,
             color=QOS_COLORS.get(qos, "gray"),
             label=QOS_LABELS.get(qos, f"QoS {qos}"),
         )
 
     ax.set_xlabel("Packet Loss (%)")
-    ax.set_ylabel("Alert Messages Lost (count)")
+    ax.set_ylabel("Alert Messages Lost (%)")
+    ax.set_ylim(bottom=0)
     ax.set_title(
-        "Alert Messages Lost vs Packet Loss by QoS\n"
+        "Alert Messages Lost (%) vs Packet Loss by QoS\n"
         f"({_DELAY_SUBTITLE})"
     )
-    ax.legend()
+    # Legend outside to the right so QoS 1/2 near-zero lines stay visible
+    ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1), borderaxespad=0)
     ax.grid(True, alpha=0.3)
+    fig.tight_layout()
     _save_fig(fig, os.path.join(graphs_dir, "alerts_lost_vs_loss.png"))
 
 
@@ -837,7 +889,7 @@ def plot_latency_vs_delay(df: pd.DataFrame, graphs_dir: str) -> None:
         "Average Latency vs Network Delay by QoS\n"
         f"({_LOSS_SUBTITLE})"
     )
-    ax.legend()
+    ax.legend(loc="best")
     ax.grid(True, alpha=0.3)
     _save_fig(fig, os.path.join(graphs_dir, "latency_vs_delay.png"))
 
@@ -886,13 +938,9 @@ def plot_summary_dashboard(df: pd.DataFrame, graphs_dir: str) -> None:
     """
     2 × 3 dashboard of key metrics (all vs packet-loss %, averaged over delays).
     Panels: Latency | Delivery Ratio | Duplicates
-            Throughput | Alert Delay | Alerts Lost
+            Throughput | Alert Delay | Alerts Lost %
     """
     c = CONFIG
-    df = df.copy()
-    df["alerts_lost"] = (
-        df[c["RES_ALERTS_SENT"]] - df[c["RES_ALERTS_RECEIVED"]]
-    ).clip(lower=0)
 
     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
     fig.suptitle(
@@ -901,30 +949,35 @@ def plot_summary_dashboard(df: pd.DataFrame, graphs_dir: str) -> None:
         fontweight="bold",
     )
 
-    # (axis, metric_key, y-label, panel title)
+    # (axis, metric_key, y-label, panel title, ylim_bottom)
     panels = [
-        (axes[0, 0], c["RES_AVG_LATENCY_MS"],    "Avg Latency (ms)",      "Latency vs Loss"),
-        (axes[0, 1], c["RES_DELIVERY_RATIO"],     "Delivery Ratio",        "Delivery Ratio vs Loss"),
-        (axes[0, 2], c["RES_DUPLICATES"],         "Duplicate Count",       "Duplicates vs Loss"),
-        (axes[1, 0], c["RES_THROUGHPUT_MSG_S"],   "Throughput (msg/s)",    "Throughput vs Loss"),
-        (axes[1, 1], c["RES_AVG_ALERT_DELAY_MS"], "Alert Latency (ms)",    "Alert Delay vs Loss"),
-        (axes[1, 2], "alerts_lost",               "Alerts Lost",           "Alerts Lost vs Loss"),
+        (axes[0, 0], c["RES_AVG_LATENCY_MS"],    "Avg Latency (ms)",      "Latency vs Loss",         None),
+        (axes[0, 1], c["RES_DELIVERY_RATIO"],     "Delivery Ratio",        "Delivery Ratio vs Loss",  None),
+        (axes[0, 2], c["RES_DUPLICATES"],         "Duplicate Count",       "Duplicates vs Loss",      None),
+        (axes[1, 0], c["RES_THROUGHPUT_MSG_S"],   "Throughput (msg/s)",    "Throughput vs Loss",      None),
+        (axes[1, 1], c["RES_AVG_ALERT_DELAY_MS"], "Alert Latency (ms)",    "Alert Delay vs Loss",     None),
+        (axes[1, 2], c["RES_ALERTS_LOST_PCT"],    "Alerts Lost (%)",       "Alerts Lost % vs Loss",   0),
     ]
 
-    for ax, metric, ylabel, title in panels:
+    for ax, metric, ylabel, title, ylim_bot in panels:
         agg = _agg_vs_loss(df, metric)
         for qos in sorted(df[c["RES_QOS"]].unique()):
             sub = agg[agg[c["RES_QOS"]] == qos].dropna(subset=[metric])
             ax.plot(
                 sub[c["RES_LOSS_PCT"]], sub[metric],
-                marker="o", linewidth=2,
+                marker=QOS_MARKERS.get(qos, "o"),
+                linestyle=QOS_LINESTYLES.get(qos, "-"),
+                linewidth=2,
+                markersize=5,
                 color=QOS_COLORS.get(qos, "gray"),
                 label=QOS_LABELS.get(qos, f"QoS {qos}"),
             )
         ax.set_xlabel("Packet Loss (%)", fontsize=9)
         ax.set_ylabel(ylabel, fontsize=9)
         ax.set_title(title, fontsize=10)
-        ax.legend(fontsize=7)
+        if ylim_bot is not None:
+            ax.set_ylim(bottom=ylim_bot)
+        ax.legend(fontsize=7, loc="best")
         ax.grid(True, alpha=0.3)
 
     fig.text(

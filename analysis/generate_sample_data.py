@@ -34,7 +34,12 @@ from datetime import datetime, timezone, timedelta
 # ---------------------------------------------------------------------------
 MACHINES = [f"MACHINE_{i:02d}" for i in range(1, 6)]   # 5 machines
 MESSAGES_PER_MACHINE = 60                                # ~1 msg/s for 60 s
-ALERT_PROBABILITY = 0.05                                 # 5 % of msgs are alerts
+ALERT_PROBABILITY = 0.05                                 # random alert probability
+# Forced alert cadence: every ALERT_EVERY_N messages per machine is an alert,
+# guaranteeing ≥ (MESSAGES_PER_MACHINE / ALERT_EVERY_N) × len(MACHINES) alerts
+# per run regardless of random draws. With 5 machines × 60 msgs / 5 = 60 forced
+# alerts plus random ones → well over 100 alerts per run.
+ALERT_EVERY_N = 5                                        # one forced alert every ~5 s
 
 QOS_VALUES = [0, 1, 2]
 LOSS_VALUES = [0, 5, 10, 20]      # percent
@@ -56,6 +61,14 @@ LATENCY_JITTER_MS = {
 
 # Extra latency added per retransmit for QoS 1 (ms)
 RETRANSMIT_EXTRA_MS = 20
+
+# Retransmit-timeout latency penalty added when a PUBACK / PUBREC is lost and
+# the publisher must wait for a timeout before retrying. Modelled as a uniform
+# draw from [RETRANSMIT_TIMEOUT_MIN_MS, RETRANSMIT_TIMEOUT_MAX_MS].
+# This makes average latency grow visibly with loss_percent for QoS 1 and 2.
+# QoS 0 has no retransmits so it is never affected.
+RETRANSMIT_TIMEOUT_MIN_MS = 1000   # 1 s  – realistic MQTT default is 1–5 s
+RETRANSMIT_TIMEOUT_MAX_MS = 2000   # 2 s
 
 MONITOR_COLUMNS = [
     "recv_time", "topic", "machine_id", "sequence_number",
@@ -135,7 +148,11 @@ def generate_run(qos: int, loss_percent: int, delay_ms: int,
             # Sensor values with realistic variation
             temperature = random.gauss(75.0, 5.0)
             vibration = random.gauss(4.0, 0.8)
-            is_alert = int(random.random() < ALERT_PROBABILITY)
+            # Forced alert every ALERT_EVERY_N messages (guarantees 100+ per run)
+            # plus random probability on other messages.
+            is_alert = int(
+                (seq % ALERT_EVERY_N == 0) or (random.random() < ALERT_PROBABILITY)
+            )
             topic = f"factory/{machine_id.lower()}/temperature"
             status = "ALERT" if is_alert else "RUNNING"
 
@@ -182,11 +199,35 @@ def generate_run(qos: int, loss_percent: int, delay_ms: int,
                 })
 
             elif qos == 1:
-                # No loss; first delivery always arrives
+                # No loss; first delivery always arrives.
+                # When a PUBACK is lost (modelled by dup_prob), the publisher
+                # waits for its retransmit timeout (1–2 s) before resending.
+                # That timeout adds to the ORIGINAL message's observed latency
+                # because the subscriber receives the first copy immediately,
+                # but the round-trip from the publisher's perspective includes
+                # the full timeout.  We model it here by adding the timeout to
+                # the first-copy latency so avg_latency grows with loss.
                 latency_ms = (
                     delay_ms
                     + _jitter(BASE_LATENCY_MS[1], LATENCY_JITTER_MS[1])
                 )
+
+                # Duplicate probability scales linearly with packet loss.
+                # At 0 % loss every PUBACK arrives → no retransmit → 0 dups.
+                # As loss rises, more PUBACKs are dropped, the publisher
+                # times out and retransmits with dup_flag=1, raising the rate.
+                # (Real QoS 1 can dup on timeout even without loss, but that
+                # is omitted here so the 0%-loss baseline is clean for graphs.)
+                dup_prob = min(0.30, loss_prob * 1.5)
+                timed_out = random.random() < dup_prob
+
+                if timed_out:
+                    # Timeout penalty on this message's observed latency
+                    timeout_ms = random.uniform(
+                        RETRANSMIT_TIMEOUT_MIN_MS, RETRANSMIT_TIMEOUT_MAX_MS
+                    )
+                    latency_ms += timeout_ms
+
                 recv_dt = sent_dt + timedelta(milliseconds=latency_ms)
                 monitor_rows.append({
                     "recv_time": _iso(recv_dt),
@@ -200,14 +241,8 @@ def generate_run(qos: int, loss_percent: int, delay_ms: int,
                     "payload_bytes": payload_bytes,
                 })
 
-                # Duplicate probability scales linearly with packet loss.
-                # At 0 % loss every PUBACK arrives → no retransmit → 0 dups.
-                # As loss rises, more PUBACKs are dropped, the publisher
-                # times out and retransmits with dup_flag=1, raising the rate.
-                # (Real QoS 1 can dup on timeout even without loss, but that
-                # is omitted here so the 0%-loss baseline is clean for graphs.)
-                dup_prob = min(0.30, loss_prob * 1.5)
-                if random.random() < dup_prob:
+                if timed_out:
+                    # The retransmitted duplicate arrives shortly after
                     extra_ms = latency_ms + RETRANSMIT_EXTRA_MS + random.uniform(0, 20)
                     recv_dup = sent_dt + timedelta(milliseconds=extra_ms)
                     monitor_rows.append({
@@ -223,11 +258,21 @@ def generate_run(qos: int, loss_percent: int, delay_ms: int,
                     })
 
             else:  # qos == 2
-                # No loss, no duplicates; higher latency from 4-way handshake
+                # No loss, no duplicates; higher latency from 4-way handshake.
+                # Under packet loss, PUBREC or PUBREL can be dropped, forcing
+                # a timeout before the handshake retries.  Add a timeout
+                # penalty proportional to loss_prob so avg latency grows with
+                # loss just like QoS 1 (but without duplicates).
                 latency_ms = (
                     delay_ms
                     + _jitter(BASE_LATENCY_MS[2], LATENCY_JITTER_MS[2])
                 )
+                # Probability that at least one handshake packet is dropped
+                handshake_loss_prob = min(0.50, loss_prob * 2.0)
+                if random.random() < handshake_loss_prob:
+                    latency_ms += random.uniform(
+                        RETRANSMIT_TIMEOUT_MIN_MS, RETRANSMIT_TIMEOUT_MAX_MS
+                    )
                 recv_dt = sent_dt + timedelta(milliseconds=latency_ms)
                 monitor_rows.append({
                     "recv_time": _iso(recv_dt),
