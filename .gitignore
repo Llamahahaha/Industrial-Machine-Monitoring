@@ -1,4 +1,7 @@
-﻿__pycache__/
-*.pyc
-venv/
+broker/passwd
+.env
 .venv/
+__pycache__/
+*.pyc
+.DS_Store
+venv/
